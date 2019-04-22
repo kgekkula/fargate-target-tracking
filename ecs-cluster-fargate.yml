@@ -1,0 +1,307 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select a VPC that allows instances access to the Internet.
+
+  ALBSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select two public subnets in your selected VPC(ALB).
+
+  ECSSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select two private subnets in your selected VPC(ECS Service).
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: "Minimum Capacity"
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: "Desired Capacity"
+
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    Description: "Maximum Capacity"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcId
+          - ALBSubnetIds
+          - ECSSubnetIds
+      -
+        Label:
+          default: "Amazon ECS Configuration"
+        Parameters:
+          - MinCapacity
+          - DesiredCount
+          - MaxCapacity
+
+Resources:
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Security Group
+      VpcId: !Ref VpcId
+
+  ECSSecurityGroupHTTPinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: '80'
+      ToPort: '80'
+      CidrIp: 0.0.0.0/0
+
+  ECSSecurityGroupSSHinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: '22'
+      ToPort: '22'
+      CidrIp: 0.0.0.0/0
+
+  ECSSecurityGroupALBports:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: '31000'
+      ToPort: '61000'
+      SourceSecurityGroupId: !Ref ECSSecurityGroup
+
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['-', [ECSLogGroup, !Ref 'AWS::StackName']]
+      RetentionInDays: 14
+
+  ServiceSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    DependsOn: ECSSecurityGroup
+    Properties:
+      GroupDescription: !Sub "fargate-Service-SG"
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref ECSSecurityGroup
+          IpProtocol: -1
+      VpcId: !Ref VpcId
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Join ['', [!Ref 'AWS::StackName', -demo-app]]
+      Cpu: 256
+      Memory: 512
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+      - Name: simple-app
+        Cpu: 10
+        Essential: 'true'
+        Image: amd64/httpd:2.4
+        Memory: 300
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref 'CloudwatchLogsGroup'
+            awslogs-region: !Ref 'AWS::Region'
+            awslogs-stream-prefix: demo-app
+        MountPoints:
+        - ContainerPath: /usr/local/apache2/htdocs
+          SourceVolume: my-vol
+        PortMappings:
+        - ContainerPort: 80
+      - Name: busybox
+        Cpu: 10
+        Command: ['/bin/sh -c "while true; do echo ''<html> <head> <title>Amazon ECS
+            Sample App</title> <style>body {margin-top: 40px; background-color: #333;}
+            </style> </head><body> <div style=color:white;text-align:center> <h1>Amazon
+            ECS Sample App</h1> <h2>Congratulations!</h2> <p>Your application is now
+            running on a container in Amazon ECS v3.</p>'' > top; /bin/date > date ;
+            echo ''</div></body></html>'' > bottom; cat top date bottom > /usr/local/apache2/htdocs/index.html
+            ; sleep 1; done"']
+        EntryPoint: [sh, -c]
+        Essential: false
+        Image: busybox
+        Memory: 200
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref 'CloudwatchLogsGroup'
+            awslogs-region: !Ref 'AWS::Region'
+            awslogs-stream-prefix: demo-app
+        VolumesFrom:
+        - SourceContainer: simple-app
+      Volumes:
+      - Name: my-vol
+
+
+  ECSALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ECSALB
+      Scheme: internet-facing
+      Subnets: !Ref ALBSubnetIds
+      SecurityGroups: [!Ref ECSSecurityGroup]
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref 'ECSTargetGroup'
+      LoadBalancerArn: !Ref 'ECSALB'
+      Port: '80'
+      Protocol: HTTP
+
+  ECSALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: ALBListener
+    Properties:
+      Actions:
+      - Type: forward
+        TargetGroupArn: !Ref 'ECSTargetGroup'
+      Conditions:
+      - Field: path-pattern
+        Values: [/]
+      ListenerArn: !Ref 'ALBListener'
+      Priority: 1
+
+  ECSTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: ECSALB
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Name: ECSTargetGroup
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      TargetType: ip
+      VpcId: !Ref 'VpcId'
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+          Subnets:
+            - !Select [0, !Ref ECSSubnetIds]
+            - !Select [1, !Ref ECSSubnetIds]
+      LoadBalancers:
+      - ContainerName: simple-app
+        ContainerPort: '80'
+        TargetGroupArn: !Ref ECSTargetGroup
+      TaskDefinition: !Ref TaskDefinition
+
+  ServiceAutoScalingTarget:
+      Type: AWS::ApplicationAutoScaling::ScalableTarget
+      Properties:
+        MaxCapacity: !Ref MaxCapacity
+        MinCapacity: !Ref MinCapacity
+        ResourceId:
+          Fn::Join:
+          - "/"
+          - - service
+            - !Ref ECSCluster
+            - !GetAtt [Service, Name]
+        RoleARN: !GetAtt ServiceAutoScaleRole.Arn
+        ScalableDimension: ecs:service:DesiredCount
+        ServiceNamespace: ecs
+
+
+  ServiceAutoScaleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [application-autoscaling.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: ['ecs:DescribeServices', 'ecs:UpdateService', 'cloudwatch:DescribeAlarms']
+            Resource: '*'
+
+  TargetTrackingCPUPolicy:
+      Type: AWS::ApplicationAutoScaling::ScalingPolicy
+      Properties:
+        PolicyName: Fargate-TTScalingPolicy
+        PolicyType: TargetTrackingScaling
+        ScalingTargetId:
+          Ref: ServiceAutoScalingTarget
+        ScalableDimension: ecs:service:DesiredCount
+        ServiceNamespace: ecs
+        TargetTrackingScalingPolicyConfiguration:
+          TargetValue: 75.0
+          ScaleInCooldown: 60
+          ScaleOutCooldown: 60
+          PredefinedMetricSpecification:
+            PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+              Resource: '*'
+
+Outputs:
+  ECSService:
+    Value: !Ref Service
+  ECSCluster:
+    Value: !Ref ECSCluster
+  ECSALB:
+    Description: Your ALB DNS URL
+    Value: !Join ['', [!GetAtt [ECSALB, DNSName]]]
+  TaskDef:
+    Value: !Ref TaskDefinition
